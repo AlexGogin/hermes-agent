@@ -114,3 +114,33 @@ def test_quoted_entry_survives_index_trim(sent_index, monkeypatch):
     final = json.loads(sent_index.read_text(encoding="utf-8"))
     assert f"{CHAT_ID}:41219" in final, "quoted entry was evicted by the FIFO trim"
     assert f"{CHAT_ID}:old" not in final, "the oldest entry should have been evicted instead"
+
+
+@pytest.mark.asyncio
+async def test_legacy_send_then_quote_reply_carries_text(sent_index):
+    """End to end: a legacy send is indexed, and quoting it later reaches the agent's event."""
+    from gateway.platforms.event import MessageType
+
+    adapter = _make_adapter()
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
+
+    sent = await adapter.send(CHAT_ID, "Вот ответ агента, который процитируют")
+    assert sent.success
+
+    inbound = SimpleNamespace(
+        chat=SimpleNamespace(id=int(CHAT_ID), type="private", title=None, full_name="Александр Гогин"),
+        from_user=SimpleNamespace(id=42, full_name="Александр Гогин", is_bot=False),
+        text="Вот пример такого сообщения",
+        message_thread_id=None,
+        message_id=1002,
+        reply_to_message=SimpleNamespace(message_id=777, text=None, caption=None),
+        quote=None,
+        date=None,
+        forum_topic_created=None,
+    )
+
+    event = adapter._build_message_event(inbound, MessageType.TEXT)
+
+    assert event.reply_to_message_id == "777"
+    assert event.reply_to_text == "Вот ответ агента, который процитируют"
