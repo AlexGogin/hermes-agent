@@ -3488,8 +3488,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
             delivered.append(str(msg.message_id))
-            # Telegram echoes no body in ``reply_to_message``: a later quote-reply resolves only here.
-            await self._record_sent_text(chat_id, msg.message_id, quotable_text(chunk, mdv2=True))
+            # Index what we sent: Telegram does not echo a message body back in
+            # ``reply_to_message``, so a later quote-reply resolves ONLY through this index.
+            # The legacy MarkdownV2 path carries ~95% of outbound messages — without this
+            # write their quoted text is unrecoverable and the agent answers blind.
+            await self._record_sent_text(chat_id, msg.message_id, _strip_mdv2(chunk))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
@@ -3645,6 +3648,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         try:
             await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
             await self._after_legacy_edit(chat_id, message_id, content, plain, finalize, _saturated_preview)
+            if finalize:
+                # The finalized text is what the user sees and quotes — keep it resolvable.
+                await self._record_sent_text(chat_id, message_id, _strip_mdv2(content) if content else "")
+            return SendResult(success=True, message_id=message_id)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -6428,6 +6435,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             try:
                 from gateway import rich_sent_store
                 reply_to_text = rich_sent_store.lookup(str(message.chat.id), reply_to_id)
+                if reply_to_text:
+                    # A message that gets quoted is worth keeping: refresh its timestamp so the
+                    # FIFO trim does not evict it while the conversation still refers to it.
+                    rich_sent_store.touch(str(message.chat.id), reply_to_id)
             except Exception:
                 # Extract reply context if this message is a reply. Prefer Telegram's native partial quote
                 # (message.quote, TextQuote) so a user replying to a single selected substring of a prior
