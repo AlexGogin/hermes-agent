@@ -116,7 +116,7 @@ async def _shutdown_abandoned_app(app) -> None:
             logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -131,7 +131,7 @@ except ImportError as _import_exc:
     # Not installed is a normal optional state (debug); installed-but-broken logs its traceback (#87455).
     logger.log(logging.DEBUG if _import_exc.name == "telegram" else logging.WARNING, "[Telegram] python-telegram-bot import failed: %s", _import_exc, exc_info=True)
     TELEGRAM_AVAILABLE = False
-    Update = Bot = Message = InlineKeyboardButton = InlineKeyboardMarkup = Application = Any
+    Update = Bot = Message = InlineKeyboardButton = InlineKeyboardMarkup = ReplyKeyboardMarkup = Application = Any
     CommandHandler = CallbackQueryHandler = InlineQueryHandler = TypeHandler = TelegramMessageHandler = HTTPXRequest = Any
     LinkPreviewOptions = filters = ParseMode = ChatType = None
 
@@ -268,7 +268,7 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, LinkPreviewOptions, Application, ReplyKeyboardMarkup
     global CommandHandler, CallbackQueryHandler, InlineQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest, TypeHandler
     if TELEGRAM_AVAILABLE:
@@ -282,8 +282,8 @@ def check_telegram_requirements() -> bool:
         import importlib
         _tg, _ext, _const, _req = (
             importlib.import_module(m) for m in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"))
-        Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup = (
-            getattr(_tg, n) for n in ("Update", "Bot", "Message", "InlineKeyboardButton", "InlineKeyboardMarkup"))
+        Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup = (
+            getattr(_tg, n) for n in ("Update", "Bot", "Message", "InlineKeyboardButton", "InlineKeyboardMarkup", "ReplyKeyboardMarkup"))
         LinkPreviewOptions = getattr(_tg, "LinkPreviewOptions", None)
         Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, TelegramMessageHandler = (
             getattr(_ext, n) for n in ("Application", "CommandHandler", "CallbackQueryHandler", "InlineQueryHandler", "MessageHandler"))
@@ -370,6 +370,21 @@ _MEDIA_SEND_READ_TIMEOUT = 60.0
 # Text send used to hang forever on a shielded httpcore socket (NordVPN/Telegram sticky IP).
 # A wedged send froze getUpdates on the same loop. Bound every text send/edit and media upload.
 _TEXT_SEND_DEADLINE = 30.0
+
+# CEO main menu (2026-10-30): two reply-keyboard buttons in one row, private chats
+# only. A reply-keyboard press arrives as the button label text, so the ingest side
+# (_map_main_menu_button) rewrites the labels to the strings the buttons send.
+# Telegram reply-keyboard buttons ALWAYS send their own label as the visible
+# message (label == payload; there is no hidden-text button). So the buttons
+# are labelled with the exact text they must send. The map below still
+# translates presses of the OLD labels («Статус»/«Дальше») cached on a client
+# before the relabel, so stale keyboards keep working.
+_MAIN_MENU_BUTTONS = ("ну как там", "/gsd-process --next")
+_MAIN_MENU_LEGACY_BUTTONS = ("Статус", "Дальше")
+_MAIN_MENU_TEXT_MAP = {
+    "Статус": "ну как там",
+    "Дальше": "/gsd-process --next",
+}
 # Wall-clock cap on one media upload (whole request: pool wait + connect + body upload + server
 # processing). NOT `_MEDIA_SEND_READ_TIMEOUT`: that is httpx's per-phase stall budget (time-to-first-byte
 # after the body is sent), whereas this bounds the entire call, so it must leave room for bandwidth. The
@@ -3206,6 +3221,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
 
     async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any]):
         """MarkdownV2 first; on a Bot API entity-parse refusal resend as stripped plain text."""
+        # Our main-menu fix (CEO 31.10): attach the reply keyboard to every text
+        # chunk. Upstream's deadline-bounded send helper below is preserved.
+        send_kwargs = self._attach_main_menu_keyboard(send_kwargs)
         def send(text: str, mode: Any):
             return _await_with_thread_deadline(self._bot.send_message(text=text, parse_mode=mode, **send_kwargs),
                                                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
@@ -3216,6 +3234,39 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 raise
             logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
             return await send(_strip_mdv2(chunk), None)
+
+    def _attach_main_menu_keyboard(self, send_kwargs: dict[str, Any]) -> dict[str, Any]:
+        """CEO main menu: ride the persistent [Статус | Дальше] reply keyboard on every
+        outgoing text chunk in a private chat (negative/group ids never get it). Repeats
+        are harmless — Telegram keeps the keyboard shown — and it self-heals after the
+        user collapses it."""
+        if "reply_markup" in send_kwargs:
+            return send_kwargs
+        chat_id = send_kwargs.get("chat_id")
+        try:
+            if chat_id is None or int(str(chat_id)) <= 0:  # groups/channels: not a DM
+                return send_kwargs
+        except (TypeError, ValueError):
+            return send_kwargs
+        kb = getattr(self, "_main_menu_kb", None)
+        if kb is None:
+            kb = ReplyKeyboardMarkup([list(_MAIN_MENU_BUTTONS)], resize_keyboard=True, is_persistent=True)
+            self._main_menu_kb = kb
+        out = dict(send_kwargs)
+        out["reply_markup"] = kb
+        return out
+
+    @staticmethod
+    def _map_main_menu_button(event: MessageEvent, msg: Any) -> MessageEvent:
+        """A main-menu button press arrives as its label text; rewrite it to the string
+        the button is meant to send (private chats only, exact label match)."""
+        chat = getattr(msg, "chat", None)
+        if str(getattr(chat, "type", "") or "").lower() != "private":
+            return event
+        mapped = _MAIN_MENU_TEXT_MAP.get((getattr(event, "text", "") or "").strip())
+        if mapped:
+            event.text = mapped
+        return event
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
@@ -5857,7 +5908,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
         await self._ensure_forum_commands(update.message)
-        self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
+        event = await self._build_triggered_event(msg, update, MessageType.TEXT)
+        self._enqueue_text_event(self._map_main_menu_button(event, msg))
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
