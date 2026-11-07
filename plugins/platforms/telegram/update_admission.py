@@ -345,6 +345,10 @@ class TelegramApplication(Application):
             # No receipt, so a redelivery is not suppressed. Names only: no content or ids.
             logger.info("[Telegram] Update %s matched no core handler; not receipted (fields: %s)",
                         claim.update.update_id, _field_names(claim.update))
+            # Dispatched for real: the fetched-update journal no longer needs to protect it.
+            journal = getattr(self.adapter, "_fetched_journal", None)
+            if journal is not None and journal is not False:
+                journal.remove(claim.key.split(":", 1)[1])
 
     async def process_error(self, update, error, job=None, coroutine=None):
         claim = self._current_claim.get()

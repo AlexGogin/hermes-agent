@@ -499,6 +499,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._update_receipts_loaded: set = set()
         self._update_receipts_dirty: set = set()
         self._update_receipt_flush: Optional[asyncio.Task] = None
+        # Fetched-but-undispatched journal (fetched_journal.py): written at the getUpdates
+        # seam, drained by a fresh Application instance on start. Survives the
+        # confirm-then-discard window of PTB polling across rebuilds/restarts.
+        self._fetched_journal: Any = None  # FetchedUpdateJournal | False (negative cache)
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
@@ -1609,6 +1613,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         accepted generation, so a late response from a fenced poll cannot inflate the backlog."""
         if isinstance(result, list) and result:
             self._updates_received_total += len(result)
+            journal = self._get_fetched_journal()
             # Wire-level receipt for media-bearing updates: when such an update later never
             # reaches a message handler (no ``Media inbound`` line), the loss is upstream of
             # handler dispatch — this line is the seam evidence (confirmed-but-silent media
@@ -1631,6 +1636,24 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     self.name, upd.get("update_id"), msg.get("message_id"),
                     (msg.get("chat") or {}).get("id"), kind,
                     len(msg.get("caption") or ""))
+            # Journal EVERY message-family update BEFORE dispatch: PTB confirms fetched
+            # updates server-side while dispatch lags behind in the app queue; a rebuild
+            # between the two silently destroys them (fetched_journal.py).
+            if journal is not None:
+                for upd in result:
+                    if isinstance(upd, dict):
+                        journal.put(upd)
+
+    def _get_fetched_journal(self):
+        from plugins.platforms.telegram.fetched_journal import FetchedUpdateJournal
+        if self._fetched_journal is None and self._bot is not None:
+            try:
+                self._fetched_journal = FetchedUpdateJournal(self, self._bot.id)
+            except Exception:
+                logger.warning("[%s] Failed to open fetched-update journal", self.name, exc_info=True)
+                self._fetched_journal = False  # negative cache: do not retry every poll
+        journal = self._fetched_journal
+        return journal if journal is not None and journal is not False else None
 
     def _instrument_polling_request(self, request):
         """Instrument one dedicated PTB getUpdates request with progress tracking.
@@ -2744,6 +2767,52 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Install the runner's root-DM topic-transfer hook (``dm_topic_auto_transfer``); None clears."""
         self._topic_transfer_fn = fn
 
+    async def _replay_fetched_journal(self, app) -> None:
+        """Re-inject updates the previous instance fetched but never dispatched.
+
+        PTB polling confirms fetched updates server-side ahead of async dispatch; a crashed,
+        killed or generation-rebuilt instance leaves them confirmed-but-undispatched and
+        Telegram never redelivers. The journal (written at the getUpdates seam, drained on
+        completion receipts) is the only recovery source. Replay skips receipted updates
+        (already processed) and bumps attempts so poisoned updates die after a bounded count.
+        """
+        journal = self._get_fetched_journal()
+        if journal is None:
+            return
+        journal.sweep()
+        entries = journal.entries_for_replay()
+        if not entries:
+            return
+        from plugins.platforms.telegram.update_admission import _load_receipts
+        bot_id = self._bot.id
+        _load_receipts(self, bot_id)
+        prefix = f"{bot_id}:"
+        replayed = 0
+        skipped_receipted = 0
+        from telegram import Update
+        for uid, raw in entries:
+            if f"{prefix}{uid}" in self._seen_update_ids:
+                journal.remove(uid)
+                skipped_receipted += 1
+                continue
+            try:
+                update = Update.de_json(raw, self._bot)
+            except Exception:
+                logger.warning("[%s] Journal replay: update_id=%s failed to reconstruct; dropping",
+                               self.name, uid, exc_info=True)
+                journal.remove(uid)
+                continue
+            app.update_queue.put_nowait(update)
+            journal.note_attempt(uid)
+            replayed += 1
+        if replayed:
+            logger.warning(
+                "[%s] Replayed %d journaled update(s) the previous instance fetched but never "
+                "dispatched (receipted-skipped=%d) — confirm-then-discard recovery",
+                self.name, replayed, skipped_receipted)
+        if skipped_receipted:
+            logger.info("[%s] Journal: %d entr(ies) already receipted; discarded", self.name, skipped_receipted)
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
@@ -3009,6 +3078,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             self._register_handlers(self._app)
             await self._initialize_app_with_retries(builder)
             await self._app.start()
+            await self._replay_fetched_journal(self._app)
             # Profile-scoped like TELEGRAM_WEBHOOK_SECRET: under multiplex os.environ holds the DEFAULT
             # profile's URL, and registering it on a secondary bot pushes that bot's updates to the
             # default's listener (and stops polling for it).
@@ -3221,6 +3291,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._app = None
         self._bot = None
         await land_persisted_state(self)  # update receipts + flood windows, before a replacement reads them
+        # The fetched-update journal is separate from receipt/flood persistence: flush it too.
+        journal = self._fetched_journal
+        if journal is not None and journal is not False:
+            await self._await_disconnect_step(journal.flush_now(), _DISCONNECT_STEP_TIMEOUT, "fetched-journal flush")
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -6284,6 +6358,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         msg = update.message
         if not msg:
             return
+        # DIAGNOSTIC knob (sandbox/repro only, never set in production): hold the media
+        # handler mid-flight so a kill/rebuild lands inside the confirm-then-discard window.
+        _dbg_delay = int(os.getenv("TELEGRAM_DEBUG_MEDIA_DELAY_S", "0") or 0)
+        if _dbg_delay > 0:
+            logger.warning("[%s] DEBUG media-delay %ss (update_id=%s)", self.name, _dbg_delay, update.update_id)
+            await asyncio.sleep(_dbg_delay)
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg, level=logging.INFO, what="media from unauthorized user")
             return
