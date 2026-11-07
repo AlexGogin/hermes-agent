@@ -310,6 +310,14 @@ class TelegramApplication(Application):
                 # PTB's task wrapper may never start, leaving its callback unawaited.
                 if done.cancelled() and asyncio.iscoroutine(coroutine):
                     coroutine.close()
+                if done.cancelled():
+                    # Cancelled dispatch is a silent-loss vector: the update was fetched (and may
+                    # already be acked server-side) but no handler ever saw it, and PTB surfaces
+                    # no error for task cancellation. Make it loud (2026-11-07 media-loss hunt).
+                    logger.warning(
+                        "[%s] Telegram update dispatch task CANCELLED mid-flight (silent-loss "
+                        "risk): update_id=%s", self.adapter.name,
+                        getattr(getattr(coroutine, "cr_frame", None), "f_locals", {}).get("update_id"))
                 self._release_claim(claim, done)
                 self._claim_completions.discard(completion)
                 completion.set_result(None)

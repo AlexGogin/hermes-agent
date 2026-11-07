@@ -1609,6 +1609,28 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         accepted generation, so a late response from a fenced poll cannot inflate the backlog."""
         if isinstance(result, list) and result:
             self._updates_received_total += len(result)
+            # Wire-level receipt for media-bearing updates: when such an update later never
+            # reaches a message handler (no ``Media inbound`` line), the loss is upstream of
+            # handler dispatch — this line is the seam evidence (confirmed-but-silent media
+            # loss, 2026-11-07 production incident).
+            for upd in result:
+                if not isinstance(upd, dict):
+                    continue
+                msg = upd.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if not (msg.get("photo") or msg.get("document") or msg.get("video")
+                        or msg.get("audio") or msg.get("voice")):
+                    continue
+                kind = ("photo" if msg.get("photo") else
+                        "document" if msg.get("document") else
+                        "video" if msg.get("video") else
+                        "audio" if msg.get("audio") else "voice")
+                logger.info(
+                    "[%s] Media on wire: update=%s msg=%s chat=%s kind=%s caption_chars=%s",
+                    self.name, upd.get("update_id"), msg.get("message_id"),
+                    (msg.get("chat") or {}).get("id"), kind,
+                    len(msg.get("caption") or ""))
 
     def _instrument_polling_request(self, request):
         """Instrument one dedicated PTB getUpdates request with progress tracking.
