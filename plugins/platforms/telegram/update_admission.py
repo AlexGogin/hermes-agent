@@ -274,6 +274,10 @@ class TelegramApplication(Application):
         del self.adapter._inflight_update_ids[claim.key]
         if claim.accepted or (claim.completed and not claim.failed):
             _record_receipt(self.adapter, claim.key)
+            # Dispatched for real: the fetched-update journal no longer needs to protect it.
+            journal = getattr(self.adapter, "_fetched_journal", None)
+            if journal is not None and journal is not False:
+                journal.remove(claim.key.split(":", 1)[1])
 
     async def process_error(self, update, error, job=None, coroutine=None):
         claim = self._current_claim.get()
