@@ -2849,7 +2849,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             signature PTB filters otherwise reject (message.rich_message is dropped by PTB 22.8,
             so the raw payload waits in the adapter sidecar)."""
 
-            def check(self, message):
+            def filter(self, message):
+                # PTB 22 renamed the hook: MessageFilter.filter(message) — defining the old
+                # check() silently never matches (abstract filter() is not enforced).
                 key = f"{message.chat_id}:{message.message_id}"
                 if key not in adapter_self._rich_message_sidecar:
                     return False
