@@ -492,6 +492,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._seen_update_ids: dict = {}
         self._inflight_update_ids: dict = {}
         self._update_admission = None
+        # Telegram rich-message sidecar: the Bot API carries block content (paragraphs, tables,
+        # photos) in message.rich_message ONLY, with legacy text/photo fields empty, and PTB 22.8
+        # drops the unknown field when parsing. We stash the raw payload here at the wire-observation
+        # layer (keyed "chat_id:message_id") so a dedicated handler can render it (2026-11-08).
+        self._rich_message_sidecar: dict = {}
         # Completed update IDs survive adapter replacement and restarts (update_admission.py).
         # Resolved now: secondary profiles construct adapters inside their own home scope.
         from hermes_constants import get_hermes_home
@@ -1635,6 +1640,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     len(msg.get("caption") or ""))
             if journal is not None:
                 journal.put(upd)
+            # Stash rich-message block payloads the Bot API delivers ONLY in message.rich_message
+            # (legacy text/photo empty; PTB 22.8 drops the field when parsing → such updates match
+            # no handler and ghost through dispatch — 2026-11-08).
+            _rich = msg.get("rich_message") if isinstance(msg, dict) else None
+            if isinstance(_rich, dict) and isinstance(_rich.get("blocks"), list):
+                self._rich_message_sidecar[f"{(msg.get('chat') or {}).get('id')}:{msg.get('message_id')}"] = _rich
 
     def _record_updates_received(self, result) -> None:
         """Count updates Telegram handed us on the getUpdates wire (#102260). Only reached for the
@@ -2824,6 +2835,25 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         prior = {id(h) for hs in table.values() for h in hs} if isinstance(table, dict) else set()
+        adapter_self = self
+
+        class _RichGhostFilter(filters.MessageFilter):
+            """Match rich-message updates whose legacy content fields are empty — the exact
+            signature PTB filters otherwise reject (message.rich_message is dropped by PTB 22.8,
+            so the raw payload waits in the adapter sidecar)."""
+
+            def check(self, message):
+                key = f"{message.chat_id}:{message.message_id}"
+                if key not in adapter_self._rich_message_sidecar:
+                    return False
+                legacy = (message.text or message.caption or message.photo or message.document
+                          or message.video or message.audio or message.voice or message.sticker
+                          or message.location or message.poll)
+                return not legacy
+
+        # Ghost rich updates (empty legacy fields) go to the dedicated rich handler FIRST;
+        # rich messages PTB did parse are caught by the combined filter on the text handler.
+        app.add_handler(TelegramMessageHandler(_RichGhostFilter(), self._handle_rich_message))
         app.add_handler(TelegramMessageHandler((filters.TEXT | rich_message_filter(filters)) & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
@@ -6337,6 +6367,77 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             logger.warning("[Telegram] Failed to cache document: %s", _redact_telegram_error_text(e), exc_info=True)
             await self._surface_media_cache_failure(msg, event, "attachment", e, display_name=getattr(doc, "file_name", None) or None)
         return False
+
+    async def _handle_rich_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Telegram rich messages (block format: paragraphs, tables, photos). The Bot API
+        delivers their content ONLY in message.rich_message with empty legacy fields, and PTB 22.8
+        drops that field when parsing — without this handler such updates ghost through dispatch
+        (2026-11-08). Render blocks to text, download photo blocks, deliver one MessageEvent."""
+        msg = update.message
+        if not msg:
+            return
+        key = f"{msg.chat_id}:{msg.message_id}"
+        rich = self._rich_message_sidecar.pop(key, None)
+        if not isinstance(rich, dict):
+            return
+        logger.info("[%s] Rich inbound: update=%s msg=%s chat=%s blocks=%d",
+                    self.name, update.update_id, msg.message_id, msg.chat.id if msg.chat else "?",
+                    len(rich.get("blocks") or []))
+        if not self._is_user_authorized_from_message(msg):
+            self._log_blocked_user(msg, level=logging.INFO, what="rich message from unauthorized user")
+            return
+        if not self._should_process_message(msg):
+            return
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        text_parts: list = []
+        photo_file_ids: list = []
+        for block in rich.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "paragraph":
+                text = (block.get("text") or "").strip()
+                if text:
+                    text_parts.append(text)
+            elif btype == "table":
+                rows = []
+                for row in block.get("cells") or []:
+                    cells = [(str(c.get("text") or "").strip() if isinstance(c, dict) else "") for c in (row or [])]
+                    rows.append("| " + " | ".join(cells) + " |")
+                if rows:
+                    text_parts.append("\n".join(rows))
+                caption = block.get("caption")
+                if isinstance(caption, dict) and caption.get("text"):
+                    text_parts.append(f"**{caption['text']}**")
+            elif btype == "photo":
+                sizes = block.get("photo") or []
+                file_id = sizes[-1].get("file_id") if sizes and isinstance(sizes[-1], dict) else None
+                if file_id:
+                    photo_file_ids.append(file_id)
+                    text_parts.append("[изображение]")
+            else:
+                text_parts.append(f"[блок: {btype}]")
+        event.text = "\n".join(text_parts)
+        event = self._apply_telegram_group_observe_attribution(event)
+        cached_paths: list = []
+        for file_id in photo_file_ids:
+            try:
+                file_obj = await context.bot.get_file(file_id)
+                image_bytes = await file_obj.download_as_bytearray()
+                ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
+                path = await cache_image_from_bytes_async(bytes(image_bytes), ext=ext)
+                cached_paths.append((path, f"image/{ext.lstrip('.')}"))
+                logger.info("[Telegram] Cached rich-message photo at %s", path)
+            except Exception as e:
+                logger.warning("[Telegram] Failed to cache rich-message photo: %s", _redact_telegram_error_text(e), exc_info=True)
+        if len(cached_paths) == 1:
+            self._set_cached_media(event, cached_paths[0][0], cached_paths[0][1], MessageType.PHOTO,
+                                   "[Telegram] Rich photo attached at %s")
+        elif cached_paths:
+            event.media_urls = [p for p, _ in cached_paths]
+            event.media_types = [m for _, m in cached_paths]
+            event.message_type = MessageType.PHOTO
+        await self.handle_message(event)
 
     @tracking_media_items
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
