@@ -346,9 +346,21 @@ class TelegramApplication(Application):
             logger.info("[Telegram] Update %s matched no core handler; not receipted (fields: %s)",
                         claim.update.update_id, _field_names(claim.update))
             # Dispatched for real: the fetched-update journal no longer needs to protect it.
+            # Removal requires the runner handoff (accepted): a group-99-only completion proves
+            # PTB finished dispatching while NO message handler ever took the update — the exact
+            # ghost-drop signature from 2026-11-08. Receipt it (no replay storm) but KEEP the
+            # journaled raw update for forensics, and make the silent loss loud.
             journal = getattr(self.adapter, "_fetched_journal", None)
             if journal is not None and journal is not False:
-                journal.remove(claim.key.split(":", 1)[1])
+                uid = claim.key.split(":", 1)[1]
+                if claim.accepted:
+                    journal.remove(uid)
+                else:
+                    journal.cap()
+                    logger.warning(
+                        "[%s] update receipted with NO runner handoff (ghost dispatch): "
+                        "update_id=%s — journaled raw update retained",
+                        getattr(self.adapter, "name", "?"), uid)
 
     async def process_error(self, update, error, job=None, coroutine=None):
         claim = self._current_claim.get()
@@ -366,15 +378,32 @@ class TelegramApplication(Application):
         # filter/check_update layer; one that produces neither never reached PTB dispatch
         # (2026-11-08 hunt: photo+table updates receipted with zero handler traces).
         _msg = getattr(update, "message", None)
+        _svcs = [k for k in ("new_chat_members", "left_chat_member", "new_chat_title",
+                             "new_chat_photo", "delete_chat_photo", "pinned_message",
+                             "forum_topic_created", "forum_topic_edited", "forum_topic_closed",
+                             "forum_topic_reopened", "video_chat_started", "video_chat_ended",
+                             "message_auto_delete_timer_changed", "web_app_data", "passport_data",
+                             "users_shared", "chat_shared", "write_access_allowed")
+                 if getattr(_msg, k, None) is not None] if _msg is not None else []
         logger.info(
-            "[%s] update admit: id=%s kinds=%s chat=%s thread=%s topic_msg=%s",
+            "[%s] update admit: id=%s kinds=%s chat=%s thread=%s topic_msg=%s "
+            "text=%r photo=%s doc=%s vid=%s mg=%s svc=%s fwd=%s via_bot=%s edit=%s",
             getattr(self.adapter, "name", "?"), getattr(update, "update_id", None),
             [k for k in ("message", "edited_message", "channel_post", "message_reaction",
                          "forum_topic_created", "my_chat_member", "callback_query")
              if getattr(update, k, None) is not None],
             getattr(getattr(update, "effective_chat", None), "id", None),
             getattr(_msg, "message_thread_id", None),
-            getattr(_msg, "is_topic_message", None))
+            getattr(_msg, "is_topic_message", None),
+            (str(getattr(_msg, "text", None) or "")[:40] or None),
+            len(getattr(_msg, "photo", None) or []),
+            bool(getattr(_msg, "document", None)),
+            bool(getattr(_msg, "video", None)),
+            getattr(_msg, "media_group_id", None),
+            _svcs,
+            bool(getattr(_msg, "forward_origin", None) or getattr(_msg, "forward_date", None)),
+            bool(getattr(_msg, "via_bot", None)),
+            bool(getattr(update, "edited_message", None)))
         bot_id = self.bot.id
         key = f"{bot_id}:{update.update_id}"
         _load_receipts(self.adapter, bot_id)

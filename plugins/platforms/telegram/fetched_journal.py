@@ -91,6 +91,27 @@ class FetchedUpdateJournal:
             del self._entries[key]
             self._schedule_flush()
 
+    def cap(self, max_entries: int = 5000, max_age_s: float = 86400.0) -> None:
+        """Bound journal growth: ghost receipts (no runner handoff) intentionally retain entries,
+        so without a cap the file would grow forever. Keeps the newest by timestamp."""
+        self._load()
+        if not self._entries:
+            return
+        now = time.time()
+        items = [(float(rec.get("ts") or 0), str(uid))
+                 for uid, rec in self._entries.items()
+                 if now - float(rec.get("ts") or 0) <= max_age_s]
+        if len(items) > max_entries:
+            items.sort()
+            keep = {uid for _, uid in items[-max_entries:]}
+        else:
+            keep = {uid for _, uid in items}
+        dropped = [uid for uid in list(self._entries) if uid not in keep]
+        for uid in dropped:
+            del self._entries[uid]
+        if dropped:
+            self._schedule_flush()
+
     def note_attempt(self, update_id) -> None:
         key = str(update_id)
         rec = self._entries.get(key)
