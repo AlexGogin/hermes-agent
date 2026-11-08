@@ -361,6 +361,20 @@ class TelegramApplication(Application):
     async def process_update(self, update):
         if not isinstance(update, Update):
             return await super().process_update(update)
+        # Bracket-observability: one line at dispatch entry, one at the group-99 catch-all.
+        # A message that produces the admit line but no handler lines is being dropped by the
+        # filter/check_update layer; one that produces neither never reached PTB dispatch
+        # (2026-11-08 hunt: photo+table updates receipted with zero handler traces).
+        _msg = getattr(update, "message", None)
+        logger.info(
+            "[%s] update admit: id=%s kinds=%s chat=%s thread=%s topic_msg=%s",
+            getattr(self.adapter, "name", "?"), getattr(update, "update_id", None),
+            [k for k in ("message", "edited_message", "channel_post", "message_reaction",
+                         "forum_topic_created", "my_chat_member", "callback_query")
+             if getattr(update, k, None) is not None],
+            getattr(getattr(update, "effective_chat", None), "id", None),
+            getattr(_msg, "message_thread_id", None),
+            getattr(_msg, "is_topic_message", None))
         bot_id = self.bot.id
         key = f"{bot_id}:{update.update_id}"
         _load_receipts(self.adapter, bot_id)

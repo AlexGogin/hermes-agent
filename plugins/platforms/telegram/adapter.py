@@ -1597,7 +1597,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Record getUpdates progress from an observed do_request result (purely observational: PTB still
         parses the untouched payload and owns any resulting exception)."""
         status_code, payload = result
-        if generation is None or not (200 <= status_code < 300):
+        if not (200 <= status_code < 300):
             return
         try:
             # The request's own parser keeps health observation in agreement with PTB.
@@ -1605,28 +1605,25 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         except Exception:
             return
         if isinstance(envelope, dict) and envelope.get("ok") is True and "result" in envelope:
-            if self._record_polling_progress(generation):
+            # Journal + wire receipt run for EVERY accepted-HTTP response, including responses of a
+            # FENCED (superseded) generation: PTB still hands those updates to the app, and they are
+            # exactly the ones a rebuild discards — gating them behind generation progress made the
+            # loss invisible (2026-11-08). Only the heartbeat counters stay generation-gated.
+            self._log_and_journal_wire_updates(envelope.get("result"))
+            if generation is not None and self._record_polling_progress(generation):
                 self._record_updates_received(envelope.get("result"))
 
-    def _record_updates_received(self, result) -> None:
-        """Count updates Telegram handed us on the getUpdates wire (#102260). Only reached for the
-        accepted generation, so a late response from a fenced poll cannot inflate the backlog."""
-        if isinstance(result, list) and result:
-            self._updates_received_total += len(result)
-            journal = self._get_fetched_journal()
-            # Wire-level receipt for media-bearing updates: when such an update later never
-            # reaches a message handler (no ``Media inbound`` line), the loss is upstream of
-            # handler dispatch — this line is the seam evidence (confirmed-but-silent media
-            # loss, 2026-11-07 production incident).
-            for upd in result:
-                if not isinstance(upd, dict):
-                    continue
-                msg = upd.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                if not (msg.get("photo") or msg.get("document") or msg.get("video")
-                        or msg.get("audio") or msg.get("voice")):
-                    continue
+    def _log_and_journal_wire_updates(self, result) -> None:
+        """Media wire receipt + fetched-update journal for one getUpdates payload (dict-safe)."""
+        if not isinstance(result, list) or not result:
+            return
+        journal = self._get_fetched_journal()
+        for upd in result:
+            if not isinstance(upd, dict):
+                continue
+            msg = upd.get("message")
+            if isinstance(msg, dict) and (msg.get("photo") or msg.get("document") or msg.get("video")
+                                          or msg.get("audio") or msg.get("voice")):
                 kind = ("photo" if msg.get("photo") else
                         "document" if msg.get("document") else
                         "video" if msg.get("video") else
@@ -1636,9 +1633,18 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     self.name, upd.get("update_id"), msg.get("message_id"),
                     (msg.get("chat") or {}).get("id"), kind,
                     len(msg.get("caption") or ""))
+            if journal is not None:
+                journal.put(upd)
+
+    def _record_updates_received(self, result) -> None:
+        """Count updates Telegram handed us on the getUpdates wire (#102260). Only reached for the
+        accepted generation, so a late response from a fenced poll cannot inflate the backlog."""
+        if isinstance(result, list) and result:
+            self._updates_received_total += len(result)
             # Journal EVERY message-family update BEFORE dispatch: PTB confirms fetched
             # updates server-side while dispatch lags behind in the app queue; a rebuild
             # between the two silently destroys them (fetched_journal.py).
+            journal = self._get_fetched_journal()
             if journal is not None:
                 for upd in result:
                     if isinstance(upd, dict):
@@ -2624,6 +2630,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
     async def _on_platform_update(self, update, context) -> None:
         """Catch-all PTB handler (group 99) firing ``gateway_platform_event`` per inbound update with a
         stable envelope (no raw SDK objects) and an internal auth source. Never raises into PTB."""
+        logger.info("[%s] update dispatched (group-99): id=%s", self.name, getattr(update, "update_id", None))
         # Admission counts dispatch before any preparation can stop this group. Retain
         # accounting for callers outside that Application boundary (#102260).
         admission = getattr(self, "_update_admission", None)
