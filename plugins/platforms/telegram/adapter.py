@@ -2820,6 +2820,13 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                                self.name, uid, exc_info=True)
                 journal.remove(uid)
                 continue
+            # Replay bypasses the getUpdates seam, so the rich-message sidecar must be populated
+            # here from the same raw payload — otherwise a replayed rich update ghosts again.
+            _rmsg = raw.get("message") if isinstance(raw, dict) else None
+            _rrich = _rmsg.get("rich_message") if isinstance(_rmsg, dict) else None
+            if isinstance(_rrich, dict) and isinstance(_rrich.get("blocks"), list):
+                self._rich_message_sidecar[
+                    f"{(_rmsg.get('chat') or {}).get('id')}:{_rmsg.get('message_id')}"] = _rrich
             app.update_queue.put_nowait(update)
             journal.note_attempt(uid)
             replayed += 1
