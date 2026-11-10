@@ -45,6 +45,28 @@ def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> 
         return "<telegram error redacted>"
 
 
+def _rich_text_str(value: object) -> str:
+    """Coerce a rich-message block's text payload to plain str.
+
+    Telegram's rich format may deliver paragraph/cell text not as a string but
+    as a list of styled runs ([{"type": "bold", "text": "…"}, …]) or a dict.
+    A bare ``.strip()`` on such a payload crashes the whole update
+    (AttributeError: 'list' object has no attribute 'strip', 10.11.2026).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            _rich_text_str(run.get("text") if isinstance(run, dict) else run)
+            for run in value
+        )
+    if isinstance(value, dict):
+        return _rich_text_str(value.get("text"))
+    return str(value)
+
+
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -6405,19 +6427,20 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 continue
             btype = block.get("type")
             if btype == "paragraph":
-                text = (block.get("text") or "").strip()
+                text = _rich_text_str(block.get("text")).strip()
                 if text:
                     text_parts.append(text)
             elif btype == "table":
                 rows = []
                 for row in block.get("cells") or []:
-                    cells = [(str(c.get("text") or "").strip() if isinstance(c, dict) else "") for c in (row or [])]
+                    cells = [(_rich_text_str(c.get("text")).strip() if isinstance(c, dict) else "") for c in (row or [])]
                     rows.append("| " + " | ".join(cells) + " |")
                 if rows:
                     text_parts.append("\n".join(rows))
                 caption = block.get("caption")
-                if isinstance(caption, dict) and caption.get("text"):
-                    text_parts.append(f"**{caption['text']}**")
+                caption_text = _rich_text_str(caption.get("text")).strip() if isinstance(caption, dict) else ""
+                if caption_text:
+                    text_parts.append(f"**{caption_text}**")
             elif btype == "photo":
                 sizes = block.get("photo") or []
                 file_id = sizes[-1].get("file_id") if sizes and isinstance(sizes[-1], dict) else None
