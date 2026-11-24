@@ -3667,7 +3667,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             # ``reply_to_message``, so a later quote-reply resolves ONLY through this index.
             # The legacy MarkdownV2 path carries ~95% of outbound messages — without this
             # write their quoted text is unrecoverable and the agent answers blind.
-            await self._record_sent_text(chat_id, msg.message_id, _strip_mdv2(chunk))
+            # quotable_text = _strip_mdv2 outside code spans, code kept verbatim (#147287).
+            await self._record_sent_text(chat_id, msg.message_id, quotable_text(chunk, mdv2=True))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
@@ -3822,10 +3823,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         warn = "[%s] MarkdownV2 edit failed, falling back to plain text: %s"
         try:
             await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
+            # _after_legacy_edit indexes a finalized edit (quotable_text) — no duplicate record here.
             await self._after_legacy_edit(chat_id, message_id, content, plain, finalize, _saturated_preview)
-            if finalize:
-                # The finalized text is what the user sees and quotes — keep it resolvable.
-                await self._record_sent_text(chat_id, message_id, _strip_mdv2(content) if content else "")
             return SendResult(success=True, message_id=message_id)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
