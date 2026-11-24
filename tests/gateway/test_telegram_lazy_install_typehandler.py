@@ -43,6 +43,7 @@ def fake_telegram_sdk(monkeypatch):
             "Message",
             "InlineKeyboardButton",
             "InlineKeyboardMarkup",
+            "ReplyKeyboardMarkup",
             "LinkPreviewOptions",
             "Application",
             "CommandHandler",
@@ -61,6 +62,7 @@ def fake_telegram_sdk(monkeypatch):
         "Message",
         "InlineKeyboardButton",
         "InlineKeyboardMarkup",
+        "ReplyKeyboardMarkup",
         "LinkPreviewOptions",
     ):
         setattr(telegram_pkg, name, fakes[name])
