@@ -3360,7 +3360,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._bot = None
         await land_persisted_state(self)  # update receipts + flood windows, before a replacement reads them
         # The fetched-update journal is separate from receipt/flood persistence: flush it too.
-        journal = self._fetched_journal
+        journal = self.__dict__.get("_fetched_journal")  # bare test doubles skip __init__
         if journal is not None and journal is not False:
             await self._await_disconnect_step(journal.flush_now(), _DISCONNECT_STEP_TIMEOUT, "fetched-journal flush")
         logger.info("[%s] Disconnected from Telegram", self.name)
