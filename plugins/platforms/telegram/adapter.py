@@ -6479,10 +6479,18 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         # Always-on receipt: a confirmed-but-never-logged media update is otherwise
         # indistinguishable from "user never sent it" (2026-11-07: a photo+caption
         # message was acked by the poller and left no trace anywhere downstream).
+        # The name lookup is fail-soft: logging must never break the handler (bare
+        # test doubles have no ``platform``).
+        _adapter_name = getattr(self, "name", None) or self.__class__.__name__
+        # Fail-soft field access: the receipt log must survive bare test doubles that
+        # only carry the media payload fields.
+        _msg_id = getattr(msg, "message_id", "?")
+        _chat = getattr(msg, "chat", None)
+        _chat_id = getattr(_chat, "id", "?") if _chat is not None else "?"
         logger.info("[%s] Media inbound: update=%s msg=%s chat=%s kind=%s caption_chars=%d",
-                    self.name, update.update_id, msg.message_id, msg.chat.id if msg.chat else "?",
+                    _adapter_name, getattr(update, "update_id", "?"), _msg_id, _chat_id,
                     self._media_message_type(msg).value if hasattr(self._media_message_type(msg), "value") else self._media_message_type(msg),
-                    len(msg.caption or ""))
+                    len(getattr(msg, "caption", None) or ""))
         try:
             await self._handle_media_message_body(update, context)
         except Exception:
@@ -6490,11 +6498,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             # error callback, which a polling-generation rebuild discards by design — the
             # traceback below is the only guaranteed record.
             logger.exception("[%s] Unhandled exception in media handler (msg=%s chat=%s)",
-                             self.name, msg.message_id, msg.chat.id if msg.chat else "?")
+                             _adapter_name, _msg_id, _chat_id)
             raise
 
     async def _handle_media_message_body(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.message
+        msg = self._effective_update_message(update)  # channel posts arrive as update.channel_post
         if not msg:
             return
         # DIAGNOSTIC knob (sandbox/repro only, never set in production): hold the media
