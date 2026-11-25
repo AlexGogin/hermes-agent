@@ -254,9 +254,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
         "nvidia/nemotron-3.5-lightning-30b-a3b", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
         "z-ai/glm-5.3", "z-ai/glm-5.2", "moonshotai/kimi-k2.6", "minimaxai/minimax-m3",
     ],
+    # Live listing api.kimi.com/coding/v1/models (verified 2026-11-24): exactly these six ids.
+    # `k3.1-pro` spelling is the vendor's (dot, no `kimi-` prefix); `kimi-k3`/`kimi-k3-1-pro` do
+    # not exist on the wire — `k3` is the vendor's own short alias.
     "kimi-coding": [
-        "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "kimi-for-coding", "kimi-for-coding-highspeed",
-        "kimi-k2-thinking", "kimi-k2-thinking-turbo", "kimi-k2-turbo-preview", "kimi-k2-0905-preview",
+        "k3.1-pro", "k3.1-pro-highspeed", "k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed",
     ],
     "kimi-coding-cn": [
         "kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5",
@@ -698,6 +700,13 @@ _BORROWED_MODEL_PROVIDERS: frozenset[str] = frozenset()
 # surfaced newest model stays on top when the live API lags. Zen/Go re-expose dozens of vendors
 # and rotate them often, so their stale curated entries must not pollute the top.
 _LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "opencode-go", "meta-ai"})
+
+# Providers whose live listing is the COMPLETE truth: the picker must not pad it with curated
+# ids the endpoint no longer serves. Kimi Coding's /coding/v1/models is exact and small (6 ids
+# as of 2026-11-24); curated-first merge surfaced retired ids (`kimi-k3`, `kimi-k2.7-code`…) the
+# vendor had dropped, so /model offered models that 400 on first use. When the live fetch fails
+# the curated row still serves as the outage fallback — it is kept in sync with the wire.
+_LIVE_ONLY_PICKER_PROVIDERS: frozenset[str] = frozenset({"kimi-coding", "kimi-coding-cn"})
 
 
 # Models supporting OpenAI Priority Processing (service_tier="priority"; see

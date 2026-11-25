@@ -41,6 +41,7 @@ from hermes_cli.models_catalog_static import (
     _AZURE_FOUNDRY_RESPONSES_PREFIXES,
     _BORROWED_MODEL_PROVIDERS,
     _LIVE_FIRST_PICKER_PROVIDERS,
+    _LIVE_ONLY_PICKER_PROVIDERS,
     _MODELS_DEV_PREFERRED,
     _OPENAI_FAST_MODE_PREFIXES,
     _OPENAI_ULTRAFAST_MODELS,
@@ -1605,6 +1606,10 @@ def merge_profile_catalog(normalized: str, profile, live: Optional[list[str]]) -
     picker will later show. Empty live → ``fallback_models`` (None when the profile has none)."""
     if not live:
         rows = CuratedFallbackModels(profile.fallback_models) if profile.fallback_models else None
+    elif normalized in _LIVE_ONLY_PICKER_PROVIDERS:
+        # Live listing is the complete truth for these providers: no curated padding — a stale
+        # curated id the endpoint dropped would be offered and then 400 on first use.
+        rows = live
     else:
         curated = list(static_catalog(normalized)) or list(profile.fallback_models or ())
         if not curated:
