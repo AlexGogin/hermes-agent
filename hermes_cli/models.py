@@ -1604,12 +1604,14 @@ def merge_profile_catalog(normalized: str, profile, live: Optional[list[str]]) -
     """Combine a profile's live catalog with its curated list the way the ``/model`` picker does, so
     first-time setup (``model_setup_flows._api_key_provider_model_list``) offers the same rows the
     picker will later show. Empty live → ``fallback_models`` (None when the profile has none)."""
-    if not live:
+    if normalized in _LIVE_ONLY_PICKER_PROVIDERS:
+        # Live listing is the ONLY truth for these providers: no curated padding — a stale
+        # curated id the endpoint dropped would be offered and then 400 on first use. And no
+        # outage fallback either: an unreachable endpoint means NOTHING is verifiably
+        # available, so the picker shows an empty list instead of an unverifiable memory list.
+        rows = list(live) if live else []
+    elif not live:
         rows = CuratedFallbackModels(profile.fallback_models) if profile.fallback_models else None
-    elif normalized in _LIVE_ONLY_PICKER_PROVIDERS:
-        # Live listing is the complete truth for these providers: no curated padding — a stale
-        # curated id the endpoint dropped would be offered and then 400 on first use.
-        rows = live
     else:
         curated = list(static_catalog(normalized)) or list(profile.fallback_models or ())
         if not curated:

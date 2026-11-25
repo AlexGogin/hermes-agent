@@ -77,13 +77,17 @@ class TestKimiCodingLiveOnlyPicker:
         assert "k3.1-pro" in ids
         assert "kimi-k3" not in ids
 
-    def test_failed_live_fetch_falls_back_to_curated(self, hermetic_home):
-        """Outage path: the live probe declines and the picker serves the curated row."""
+    def test_unreachable_endpoint_shows_no_models(self, hermetic_home):
+        """CEO rule: only actually-available models are shown. An unreachable endpoint means
+        nothing is verifiably available — the picker shows an EMPTY list, not the curated
+        memory row that would 400 on first use."""
         profile = get_provider_profile("kimi-coding")
+        # merge level: declined live -> empty list (not None, so no static-catalog fallback)
+        assert merge_profile_catalog("kimi-coding", profile, None) == []
+        # picker level: same, end to end
         with patch(
             "hermes_cli.auth.resolve_api_key_provider_credentials",
             return_value=dict(KIMI_CREDS),
         ), patch.object(type(profile), "fetch_models", return_value=None):
             ids = provider_model_ids("kimi-coding", force_refresh=True)
-        assert set(ids) == WIRE_IDS
-        assert "k3.1-pro" in ids
+        assert list(ids) == []
